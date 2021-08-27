@@ -1,7 +1,7 @@
 use std::{convert::TryFrom, error::Error as StdError, fmt, path};
 use tokio::{fs::File, io::AsyncReadExt};
 
-use crate::Event;
+use crate::RawEvent;
 
 #[derive(Debug)]
 pub enum EventSourceError<E> {
@@ -42,7 +42,7 @@ pub struct EventSource<T> {
 
 impl<T> EventSource<T>
 where
-    T: TryFrom<Event>,
+    T: TryFrom<RawEvent>,
 {
     pub async fn open(path: impl AsRef<path::Path>) -> std::io::Result<EventSource<T>> {
         Ok(Self {
@@ -66,6 +66,6 @@ where
             )));
         }
 
-        T::try_from(Event::from(&self.buf)).map_err(EventSourceError::Parse)
+        T::try_from(RawEvent::from(&self.buf)).map_err(EventSourceError::Parse)
     }
 }

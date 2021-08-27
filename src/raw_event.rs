@@ -6,14 +6,14 @@ use std::time;
 /// [ 0 - 8 ] [8 - 16 ] [ 16 - 18 ] [ 18 - 20 ] [ 20 - 24 ]
 ///   secs      usecs      type        code        value
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct Event {
+pub struct RawEvent {
     pub time: time::SystemTime,
     pub typ: u16,
     pub code: u16,
     pub value: u32,
 }
 
-impl From<&[u8; 16]> for Event {
+impl From<&[u8; 16]> for RawEvent {
     fn from(buf: &[u8; 16]) -> Self {
         let seconds = LittleEndian::read_u32(&buf[0..4]);
         let microseconds = LittleEndian::read_u32(&buf[4..8]);

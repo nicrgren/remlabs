@@ -1,9 +1,9 @@
 use std::{convert::TryFrom, fmt};
 
-mod event;
 mod event_source;
+mod raw_event;
 
-use {event::Event, event_source::EventSource};
+use {event_source::EventSource, raw_event::RawEvent};
 
 // type Error = Box<dyn StdError + 'static + Send>;
 // type Result<T> = std::result::Result<T, Error>;
@@ -29,33 +29,42 @@ fn main() -> anyhow::Result<()> {
 }
 
 async fn async_main(target: &str) -> anyhow::Result<()> {
-    let ev_src = EventSource::<PenEvent>::open(target).await?;
-    let mut pen_listener = PenListener::from(ev_src);
+    let ev_src = EventSource::<Event>::open(target).await?;
+    let mut tool_events = ToolEventSource::from(ev_src);
 
     println!("Starting loop");
 
     loop {
-        match pen_listener.next().await {
-            Ok(pen) => println!("{}", pen),
+        match tool_events.next().await {
+            Ok(tool_ev) => println!("{:?}", tool_ev),
             Err(err) => eprintln!("Error: {}", err),
         }
     }
 }
 
-struct PenListener {
-    event_source: EventSource<PenEvent>,
-    state: PenListenerState,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum ToolEvent {
+    Update(Tool),
+    Removed(ToolKind),
 }
 
-impl PenListener {
-    pub fn from(event_source: EventSource<PenEvent>) -> Self {
+/// This should be generalised by making struct Pen
+/// be a struct Tool that has a kind field.
+/// For now, to get stuff going, just run with it as a Pen.
+struct ToolEventSource {
+    event_source: EventSource<Event>,
+    state: Option<ToolBuilder>,
+}
+
+impl ToolEventSource {
+    pub fn from(event_source: EventSource<Event>) -> Self {
         Self {
             event_source,
-            state: PenListenerState::WaitingForFirstPen(PenBuilder::default()),
+            state: None,
         }
     }
 
-    pub async fn next(&mut self) -> anyhow::Result<Pen> {
+    pub async fn next(&mut self) -> anyhow::Result<ToolEvent> {
         // Currently we need to listen to Tool events.
         // Tool::Pen(true) means the Pen is close to the Pad, start to build.
         // Tool::Pen(false) means the Pen was lifted and we need to reset.
@@ -63,59 +72,77 @@ impl PenListener {
         // These events dictate what we should do.
         // @TODO: Handle these events properly.
 
-        match self.state {
-            PenListenerState::WaitingForFirstPen(ref mut builder) => loop {
+        // Wait for an Appeared event.
+        let state = if let Some(ref mut state) = self.state {
+            state
+        } else {
+            // Wait for an add event.
+            loop {
                 match self.event_source.next().await? {
-                    PenEvent::Sync => {
-                        // @TODO: Use an intermediate option to remove clone.
-                        let pen = builder
-                            .build()
-                            .ok_or_else(|| anyhow::anyhow!("Received Sync but failed to build"))?;
-                        self.state = PenListenerState::PenBuilt(pen);
-                        return Ok(pen);
+                    Event::ToolAdded(ToolKind::Pen) => {
+                        let new_state = ToolBuilder::new(ToolKind::Pen);
+                        break self.state.insert(new_state);
                     }
 
-                    PenEvent::Movement(mv) => builder.apply_event(mv),
-
-                    PenEvent::Tool(Tool::Pen(false)) => {
-                        println!("Ignoring Pen lifted");
+                    Event::ToolAdded(kind) => {
+                        eprintln!("Ignoring add event for kind `{:?}`", kind);
                     }
 
                     ev => {
-                        println!("Builder ignoring Event: {:?}", ev);
+                        eprintln!("Ignoring Event: {:?}", ev);
                     }
                 }
-            },
+            }
+        };
+        loop {
+            match self.event_source.next().await? {
+                Event::Movement(mv) => match state {
+                    ToolBuilder::Building(unfinished) => unfinished.apply_movement(mv),
+                    ToolBuilder::Built(tool) => tool.apply_movement(mv),
+                },
 
-            PenListenerState::PenBuilt(ref mut pen) => loop {
-                match self.event_source.next().await? {
-                    PenEvent::Sync => return Ok(*pen),
-
-                    PenEvent::Movement(mv) => {
-                        pen.apply_movement(mv);
+                Event::Sync => match state {
+                    ToolBuilder::Building(unfinished) => {
+                        let tool = unfinished.finish().expect("Could not finish tool");
+                        *state = ToolBuilder::Built(tool);
+                        return Ok(ToolEvent::Update(tool));
                     }
 
-                    PenEvent::Tool(Tool::Pen(n)) => {
-                        println!("Got Tool Pen({}). Ign", n);
+                    ToolBuilder::Built(tool) => {
+                        return Ok(ToolEvent::Update(*tool));
                     }
-
-                    PenEvent::Tool(ev) => {
-                        println!("Builder ignoring ToolEvent: {:?}", ev);
-                    }
+                },
+                Event::ToolRemoved(ToolKind::Pen) => {
+                    self.state = None;
+                    return Ok(ToolEvent::Removed(ToolKind::Pen));
                 }
-            },
+
+                Event::ToolRemoved(kind) => {
+                    // Should really wait for a sync....
+                    eprintln!("Ignoring non Pen ToolRemoved({:?})", kind);
+                }
+
+                Event::ToolAdded(kind) => {
+                    eprintln!("Ignoring ToolAdded({:?})", kind);
+                }
+            }
         }
     }
 }
 
-enum PenListenerState {
-    WaitingForFirstPen(PenBuilder),
-
-    PenBuilt(Pen),
+enum ToolBuilder {
+    Built(Tool),
+    Building(UnfinishedTool),
 }
 
-#[derive(Default)]
-struct PenBuilder {
+impl ToolBuilder {
+    fn new(kind: ToolKind) -> Self {
+        Self::Building(UnfinishedTool::kind(kind))
+    }
+}
+
+struct UnfinishedTool {
+    kind: ToolKind,
     x: Option<u32>,
     y: Option<u32>,
     tilt_x: Option<u32>,
@@ -124,31 +151,43 @@ struct PenBuilder {
     distance: Option<u32>,
 }
 
-impl PenBuilder {
-    fn apply_event(&mut self, ev: Movement) {
-        match ev {
-            Movement::X(n) => self.x = Some(n),
-            Movement::Y(n) => self.y = Some(n),
-            Movement::TiltX(n) => self.tilt_x = Some(n),
-            Movement::TiltY(n) => self.tilt_y = Some(n),
-            Movement::Pressure(n) => self.pressure = Some(n),
-            Movement::Distance(n) => self.distance = Some(n),
+impl UnfinishedTool {
+    fn kind(kind: ToolKind) -> Self {
+        Self {
+            kind,
+            x: None,
+            y: None,
+            tilt_x: None,
+            tilt_y: None,
+            pressure: None,
+            distance: None,
         }
     }
 
-    // @TODO: Fix proper errors here.
-    fn build(&mut self) -> Option<Pen> {
+    fn apply_movement(&mut self, mv: Movement) {
+        match mv {
+            Movement::X(n) => self.x.replace(n),
+            Movement::Y(n) => self.y.replace(n),
+            Movement::TiltX(n) => self.tilt_x.replace(n),
+            Movement::TiltY(n) => self.tilt_y.replace(n),
+            Movement::Pressure(n) => self.pressure.replace(n),
+            Movement::Distance(n) => self.distance.replace(n),
+        };
+    }
+
+    // @TODO: Change Return type to Result with an error saying what field is missing.
+    fn finish(&mut self) -> Option<Tool> {
         let x = self.x.take().expect("Missing X");
         let y = self.y.take().expect("Missing Y");
-        let tx = self.tilt_x.take().expect("Missing Tilt X");
-        let ty = self.tilt_y.take().expect("Missing Tilt Y");
 
         let pressure = self.pressure.take().unwrap_or(0);
         let distance = self.distance.take().unwrap_or(0);
 
-        Some(Pen {
+        Some(Tool {
+            kind: self.kind,
             point: Point(x, y),
-            tilt: Point(tx, ty),
+            tilt_x: self.tilt_x.take(),
+            tilt_y: self.tilt_y.take(),
             height: if distance < 10 && 700 < pressure {
                 Height::Touching(pressure)
             } else {
@@ -158,37 +197,39 @@ impl PenBuilder {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-struct Pen {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct Tool {
+    kind: ToolKind,
     point: Point,
-    tilt: Point,
+    tilt_x: Option<u32>,
+    tilt_y: Option<u32>,
     height: Height,
 }
 
-impl Pen {
+impl Tool {
     fn apply_movement(&mut self, ev: Movement) {
         match ev {
             Movement::X(n) => self.point.0 = n,
             Movement::Y(n) => self.point.1 = n,
-            Movement::TiltX(n) => self.tilt.0 = n,
-            Movement::TiltY(n) => self.tilt.1 = n,
+            Movement::TiltX(n) => self.tilt_x = Some(n),
+            Movement::TiltY(n) => self.tilt_y = Some(n),
             Movement::Pressure(n) => self.height = Height::Touching(n),
             Movement::Distance(n) => self.height = Height::Distance(n),
         }
     }
 }
 
-impl fmt::Display for Pen {
+impl fmt::Display for Tool {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(
             f,
-            "Pen at {}. tilt {}. {}",
-            self.point, self.tilt, self.height
+            "Tool at {}. tilt x{:?} y{:?}. {}",
+            self.point, self.tilt_x, self.tilt_y, self.height
         )
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Height {
     Distance(u32),
     Touching(u32),
@@ -203,7 +244,7 @@ impl fmt::Display for Height {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct Point(u32, u32);
 
 impl fmt::Display for Point {
@@ -212,16 +253,29 @@ impl fmt::Display for Point {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Tool {
-    Pen(bool), // Read 1 or 0 for all tools
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum ToolKind {
+    Pen,
     Rubber,
     Touch,
     Stylus,
     Stylus2,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+impl ToolKind {
+    fn from_code(code: u16) -> Option<ToolKind> {
+        match code {
+            320 => Some(Self::Pen),
+            321 => Some(Self::Rubber),
+            330 => Some(Self::Touch),
+            331 => Some(Self::Stylus),
+            332 => Some(Self::Stylus2),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Movement {
     X(u32),
     Y(u32),
@@ -231,58 +285,91 @@ enum Movement {
     Distance(u32),
 }
 
+// More Movement, needed to parse events from /dev/input/event2
+// #define ABS_MT_TOUCH_MAJOR  0x30    /* Major axis of touching ellipse */
+// #define ABS_MT_TOUCH_MINOR  0x31    /* Minor axis (omit if circular) */
+// #define ABS_MT_WIDTH_MAJOR  0x32    /* Major axis of approaching ellipse */
+// #define ABS_MT_WIDTH_MINOR  0x33    /* Minor axis (omit if circular) */
+// #define ABS_MT_ORIENTATION  0x34    /* Ellipse orientation */
+// #define ABS_MT_POSITION_X   0x35    /* Center X touch position */
+// #define ABS_MT_POSITION_Y   0x36    /* Center Y touch position */
+// #define ABS_MT_TOOL_TYPE    0x37    /* Type of touching device */
+// #define ABS_MT_BLOB_ID      0x38    /* Group a set of packets as a blob */
+// #define ABS_MT_TRACKING_ID  0x39    /* Unique ID of initiated contact */
+// #define ABS_MT_PRESSURE     0x3a    /* Pressure on contact area */
+// #define ABS_MT_DISTANCE     0x3b    /* Contact hover distance */
+// #define ABS_MT_TOOL_X       0x3c    /* Center X tool position */
+// #define ABS_MT_TOOL_Y       0x3d    /* Center Y tool position */
+//
+//
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Events read from event1 (Only registers the pen)
-enum PenEvent {
+enum Event {
     Sync,
-    Tool(Tool),
+    ToolAdded(ToolKind),
+    ToolRemoved(ToolKind),
     Movement(Movement),
 }
 
-impl TryFrom<Event> for PenEvent {
-    type Error = UnknownPenEvent;
+impl TryFrom<RawEvent> for Event {
+    type Error = UnknownEvent;
 
-    fn try_from(ev: Event) -> Result<Self, Self::Error> {
+    fn try_from(ev: RawEvent) -> Result<Self, Self::Error> {
         match (ev.typ, ev.code) {
-            (0, _) => Ok(PenEvent::Sync),
-            (1, 320) => Ok(PenEvent::Tool(Tool::Pen(ev.value == 1))),
-            (1, 321) => Ok(PenEvent::Tool(Tool::Rubber)),
-            (1, 330) => Ok(PenEvent::Tool(Tool::Touch)),
-            (1, 331) => Ok(PenEvent::Tool(Tool::Stylus)),
-            (1, 332) => Ok(PenEvent::Tool(Tool::Stylus2)),
-            (1, code) => Err(UnknownPenEvent::ToolCode(code)),
+            (0, _) => Ok(Event::Sync),
+            (1, code) => {
+                // type 1 is a tool event.
+                // the code tells what tool
+                // value tells if it appeared or went away
+                let tool = ToolKind::from_code(code).ok_or(UnknownEvent::ToolCode(code))?;
+                match ev.value {
+                    0 => Ok(Event::ToolRemoved(tool)),
+                    1 => Ok(Event::ToolAdded(tool)),
+                    v => Err(UnknownEvent::ToolValue(v)),
+                }
+            }
 
-            (3, 0) => Ok(PenEvent::Movement(Movement::X(ev.value))),
-            (3, 1) => Ok(PenEvent::Movement(Movement::Y(ev.value))),
-            (3, 24) => Ok(PenEvent::Movement(Movement::Pressure(ev.value))),
-            (3, 25) => Ok(PenEvent::Movement(Movement::Distance(ev.value))),
-            (3, 26) => Ok(PenEvent::Movement(Movement::TiltX(ev.value))),
-            (3, 27) => Ok(PenEvent::Movement(Movement::TiltY(ev.value))),
-            (3, _) => Err(UnknownPenEvent::MovementCode(ev.code)),
+            (3, 0) => Ok(Event::Movement(Movement::X(ev.value))),
+            (3, 1) => Ok(Event::Movement(Movement::Y(ev.value))),
+            (3, 24) => Ok(Event::Movement(Movement::Pressure(ev.value))),
+            (3, 25) => Ok(Event::Movement(Movement::Distance(ev.value))),
+            (3, 26) => Ok(Event::Movement(Movement::TiltX(ev.value))),
+            (3, 27) => Ok(Event::Movement(Movement::TiltY(ev.value))),
 
-            _ => Err(UnknownPenEvent::Type(ev)),
+            (3, _) => Err(UnknownEvent::MovementCode(ev.code)),
+
+            _ => Err(UnknownEvent::Type(ev)),
         }
     }
 }
 
+//
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum UnknownPenEvent {
+enum UnknownEvent {
     ToolCode(u16),
+    ToolValue(u32),
     MovementCode(u16),
 
-    Type(Event),
+    Type(RawEvent),
 }
 
-impl std::error::Error for UnknownPenEvent {
+impl std::error::Error for UnknownEvent {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         None
     }
 }
 
-impl fmt::Display for UnknownPenEvent {
+impl fmt::Display for UnknownEvent {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             Self::ToolCode(code) => write!(f, "Unknown tool code`{:#04x}`", code),
+            Self::ToolValue(value) => write!(
+                f,
+                "Unexpected value for Tool event. Should be 0 or 1. Was:`{:#04x}`",
+                value
+            ),
             Self::MovementCode(code) => write!(f, "Unknown movement code `{:#04x}`", code),
             Self::Type(ev) => write!(
                 f,
