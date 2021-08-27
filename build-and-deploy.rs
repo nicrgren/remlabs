@@ -1,9 +1,9 @@
 #!/bin/bash
 
 
-ARCH="armv7-unknown-linux-musleabihf"
+#ARCH="armv7-unknown-linux-musleabihf"
 TARGET="root@192.168.1.192"
-#arch="armv7-unknown-linux-gnueabihf"
+ARCH="armv7-unknown-linux-gnueabihf"
 
 echo "Compiling..."
 cross build --target "$ARCH" --release || exit 1
